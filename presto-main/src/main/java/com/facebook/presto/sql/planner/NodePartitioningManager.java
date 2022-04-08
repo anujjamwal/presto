@@ -210,7 +210,7 @@ public class NodePartitioningManager
         checkArgument(!(partitioningHandle.getConnectorHandle() instanceof SystemPartitioningHandle));
         ConnectorId connectorId = partitioningHandle.getConnectorId()
                 .orElseThrow(() -> new IllegalArgumentException("No connector ID for partitioning handle: " + partitioningHandle));
-        List<Node> nodes = getNodes(session, connectorId);
+        List<Node> nodes = selectNodes(session, connectorId);
 
         ConnectorNodePartitioningProvider partitioningProvider = partitioningProviderManager.getPartitioningProvider(partitioningHandle.getConnectorId().get());
 
@@ -261,26 +261,44 @@ public class NodePartitioningManager
         return distribution.build();
     }
 
-    public List<Node> getNodes(Session session, ConnectorId connectorId)
+    /**
+     * Selects all nodes for the session and connector id combination.
+     * If a particular candidate node is dead, the node is replaced
+     * with the next non-dead node in the list.
+     * The results of the method are deterministic because the result
+     * of getAllNodes is always sorted by nodeIdentifier. This sorting
+     * happens in DiscoveryNodeManager#refreshNodesInternal method.
+     *
+     * @param session Query Session
+     * @param connectorId Non-Null ConnectorId
+     * @return List of Nodes with connectorId
+     */
+    private List<Node> selectNodes(Session session, ConnectorId connectorId)
     {
-        // Nodes returned by the node selector are already sorted based on nodeIdentifier. No need to sort again
         List<InternalNode> allNodes = nodeScheduler.createNodeSelector(session, connectorId).getAllNodes();
+        List<InternalNode> selectedNodes = new ArrayList<>(allNodes);
 
-        ImmutableList.Builder<Node> nodeBuilder = ImmutableList.builder();
-        int nodeCount = allNodes.size();
-        for (int i = 0; i < nodeCount; i++) {
-            InternalNode node = allNodes.get(i);
-            if (node.getNodeStatus() == DEAD) {
-                // Replace dead nodes with the first alive node to the right of it in the sorted node list
-                int index = (i + 1) % nodeCount;
-                while (node.getNodeStatus() == DEAD && index < nodeCount) {
-                    node = allNodes.get(index);
-                    index = (index + 1) % nodeCount;
-                }
-                nodeSelectionStats.incrementBucketedNonAliveNodeReplacedCount();
-            }
-            nodeBuilder.add(node);
+        int lastNonDeadNode = selectedNodes.size() - 1;
+
+        while (lastNonDeadNode > 0 && selectedNodes.get(lastNonDeadNode).getNodeStatus() != DEAD) {
+            lastNonDeadNode -= 1;
         }
-        return nodeBuilder.build();
+
+        if (lastNonDeadNode < 0) {
+            throw new IllegalStateException(String.format("All nodes for query: %s connectorId: %s were dead", session.getQueryId(), connectorId));
+        }
+
+        for (int i = lastNonDeadNode - 1; i >= 0; i--) {
+            if (selectedNodes.get(i).getNodeStatus() == DEAD) {
+                nodeSelectionStats.incrementBucketedNonAliveNodeReplacedCount();
+                selectedNodes.set(i, selectedNodes.get(i + 1));
+            }
+        }
+
+        for (int i = lastNonDeadNode + 1; i < selectedNodes.size(); i++) {
+            nodeSelectionStats.incrementBucketedNonAliveNodeReplacedCount();
+            selectedNodes.set(i, selectedNodes.get(0));
+        }
+        return Collections.unmodifiableList(selectedNodes);
     }
 }
